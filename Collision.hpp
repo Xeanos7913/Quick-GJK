@@ -664,7 +664,7 @@ float squaredDistanceBetweenEdgesGJK(const glm::vec3& p1, const glm::vec3& q1, c
     return glm::length2(c1 - c2); // Squared distance between the closest points on the segments
 }
 
-// Find the closest pair of edges between two OBBs
+// Find the closest pair of edges between two colliders
 std::vector<std::pair<std::pair<glm::vec3, glm::vec3>, std::pair<glm::vec3, glm::vec3>>> findClosestEdgesGJK(const PolygonalFace& face1, const PolygonalFace& face2) {
     std::vector<std::pair<glm::vec3, glm::vec3>> edges1 = face1.getEdges();
     std::vector<std::pair<glm::vec3, glm::vec3>> edges2 = face2.getEdges();
