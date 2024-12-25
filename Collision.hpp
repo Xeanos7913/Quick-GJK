@@ -762,6 +762,8 @@ std::vector<glm::vec3> clipFaceAgainstReference(const PolygonalFace& incidentFac
     std::vector<glm::vec3> clippedVertices = incidentFace.faceVertices;
     const float epsilon = 0.001f;  // Tolerance for numerical precision
 
+    // For Vertex-Face and Face-Face collisions. This can fail at certain edge-edge collisions, hencewhy we also have a HandleEdgeCollision() function, in case this one fails.
+
     // Loop through each face of the reference collider
     for (size_t faceIndex = 0; faceIndex < referenceCollider.faces.size(); ++faceIndex) {
         // Create a PolygonalFace for the current face of the reference collider
@@ -774,7 +776,8 @@ std::vector<glm::vec3> clipFaceAgainstReference(const PolygonalFace& incidentFac
         // Calculate the centroid of the reference face (in world coordinates)
         glm::vec3 planePoint = referenceFace.faceVertices[0];
 
-        // Perform Sutherland-Hodgman clipping for each plane
+        // Perform Sutherland-Hodgman clipping for each plane (Once again, not good approach here. Ideally, we should have a map to the neighboring faces to the reference face, and clip against them
+        // but of course, I didn't implement that here, we loop through EVERY face in the hull, clipping our way through. This is a big area for improvement.)
         std::vector<glm::vec3> inputVertices = clippedVertices;
         clippedVertices.clear();
 
@@ -824,6 +827,7 @@ std::vector<glm::vec3> clipFaceAgainstReference(const PolygonalFace& incidentFac
         for (const auto& vertex : clippedVertices) {
             bool isDuplicate = false;
             for (const auto& uniqueVertex : uniqueVertices) {
+                // You can use your own epsilon here if you want. See what works best for you ig.
                 if (glm::length(vertex - uniqueVertex) < epsilon) {
                     isDuplicate = true;
                     break;
@@ -840,7 +844,7 @@ std::vector<glm::vec3> clipFaceAgainstReference(const PolygonalFace& incidentFac
 
     // bruh
     else {
-        std::cout << "empty" << std::endl; // ideally, should never happen.
+        std::cout << "empty" << std::endl; // ideally, should never happen because we call clipping only when gjk detects a collision. So, there NEEDS to be at least 1 contact point.
         return clippedVertices;
     }
 }
@@ -914,6 +918,8 @@ gCollisionResult EPA(GJKsimplex& simplex, Polytope* coll1, Polytope* coll2) {
 
             int refOrInci, referenceFaceIndex, incidentFaceIndex;
 
+            // This part of the code can be more efficient, but I don't do that here of course, cause I'm me. You can do it on your own, it's not that difficult.
+            
             // find the manifold information
             findContactManifoldFaces(coll1, coll2, faces[closest_face].normal, referenceFace, incidentFace, referenceFaceIndex, incidentFaceIndex, refOrInci);
 
@@ -941,6 +947,10 @@ gCollisionResult EPA(GJKsimplex& simplex, Polytope* coll1, Polytope* coll2) {
         }
 
         // Rebuild the polytope with loose edges, if the algorithm hasn't converged yet.
+
+        // BEWARE! Sometimes (rarely) the loose edges return vector subscript out of range exceptions! 
+        //I'm not even sure why exactly, but restarting the application fixes it. We can handle those exceptions quite easily by just checking if the subscript we're trying to access is there inside the vector or not.
+        // if not, just skip this iteration using continue and move onto the next. Anyhow, this doesn't happen often, and after rigorous testing, it has happened less than 1% of the time, so I think it's reletively safe.
         glm::vec3 loose_edges[EPA_MAX_NUM_LOOSE_EDGES][2];
         int num_loose_edges = 0;
 
