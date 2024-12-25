@@ -11,7 +11,7 @@ https://youtu.be/PWnCpF387UY
 
 If you look at the internal code, you'll notice a GameObject* owner inside the Collider struct. This NEEDS to be replaced by your own Entity from your ECS or whatever you're using. Basically, it needs the owner's transform matrix for the mathematics it does.
 
-The project does NOT support any concave meshes. It has been tested using concave meshes loaded in from .obj files.
+The project does NOT support any concave meshes. It has been tested using convex meshes loaded in from .obj files.
 
 ## Usage
 
