@@ -669,7 +669,9 @@ std::vector<std::pair<std::pair<glm::vec3, glm::vec3>, std::pair<glm::vec3, glm:
     std::vector<std::pair<glm::vec3, glm::vec3>> edges1 = face1.getEdges();
     std::vector<std::pair<glm::vec3, glm::vec3>> edges2 = face2.getEdges();
 
-    float minDistanceSquared = 0.01f;
+    // Not the best solution for this! But I was too lazy to implement a better solution. Ideally what we should do is, if we find no edges below this epsilon,
+    // we should check for the closest edge. Because the only time we won't find edges within epsilon is when there has been significant overlap, and we need to push the colliders apart!!!
+    float minDistanceSquared = 0.01f;  // I'm talking about this epsilon here. It's quite an arbitrary value I just randomly put here, you should see what works best for you.
     std::vector<std::pair<std::pair<glm::vec3, glm::vec3>, std::pair<glm::vec3, glm::vec3>>> closestEdges;
 
     // Iterate over all edge pairs
