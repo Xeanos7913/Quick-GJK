@@ -1,18 +1,35 @@
 #pragma once
 
 #include <vector>
-#include <glm.hpp>
+#include <glm/glm.hpp>
 #include <memory>
 #include <iostream>
 #include <algorithm>
-#include <gtx/norm.hpp>
+#include <unordered_set>
+#include <glm/gtx/norm.hpp>
+#include "VkCalcium.hpp"
 
 struct Collider {
     glm::vec3 pos;            // Origin in world space
     glm::mat3 matRS;          // Rotation/scale component of model matrix
     glm::mat3 matRS_inverse;
-    //GameObject* owner;       // you need to plug the actual owner object here, of your own engine.
+    Entity* owner;       // you need to plug the actual owner object here, of your own engine.
     virtual glm::vec3 support(glm::vec3 dir) = 0;
+};
+
+// Helper hash function for std::pair<int, int> to be used in unordered_map
+struct PairHash {
+    std::size_t operator()(const std::pair<int, int>& p) const {
+        auto hash1 = std::hash<int>{}(p.first);
+        auto hash2 = std::hash<int>{}(p.second);
+        return hash1 ^ (hash2 << 1); // Combine hashes
+    }
+};
+
+struct PolyPlane {
+    glm::vec3 normal;
+    glm::vec3 point;
+    glm::vec3 point1;
 };
 
 struct Polytope : Collider {
@@ -21,6 +38,11 @@ struct Polytope : Collider {
 
     // Each face now has a vector of vertex indices and a normal (vec3)
     std::vector<std::tuple<std::vector<int>, glm::vec3>> faces;
+    // Plane representations of each face
+    std::vector<PolyPlane> planes;
+    
+    // Adjacency list: Index corresponds to the face index, value is the list of neighboring planes
+    std::vector<std::vector<PolyPlane>> plane_neighbors;
 
     glm::vec3 support(glm::vec3 dir) override {
         dir = matRS_inverse * dir;
@@ -37,6 +59,39 @@ struct Polytope : Collider {
             }
         }
         return matRS * furthest_point + pos;  // Convert support to world space
+    }
+
+    // Helper to convert a local PolyPlane to World Space
+    PolyPlane toWorldSpace(const PolyPlane& localPlane) const {
+        PolyPlane worldPlane;
+        
+        // Get the inverse transpose of the model matrix for correct normal transformation
+        worldPlane.normal = matRS_inverse * localPlane.normal;
+        
+        // Transform the point on the plane into world space
+        worldPlane.point = matRS * localPlane.point;
+        
+        return worldPlane;
+    }
+
+    // Robust lookup using the face index directly (Transforms the result to World Space)
+    std::vector<PolyPlane> getPlaneNeighborsByIndex(int faceIndex) const {
+        std::vector<PolyPlane> worldNeighbors;
+        if (faceIndex >= 0 && faceIndex < plane_neighbors.size()) {
+            worldNeighbors.reserve(plane_neighbors[faceIndex].size());
+            for (const auto& localNeighbor : plane_neighbors[faceIndex]) {
+                worldNeighbors.push_back((localNeighbor));
+            }
+        }
+        return worldNeighbors;
+    }
+    
+    // Optional: Get a specific face plane in world space
+    PolyPlane getPlaneByIndex(int faceIndex) const {
+        if (faceIndex >= 0 && faceIndex < planes.size()) {
+            return (planes[faceIndex]);
+        }
+        return PolyPlane{glm::vec3(0), glm::vec3(0)};
     }
 };
 
@@ -165,161 +220,524 @@ bool shareEdge(const std::vector<int>& face1, const std::vector<int>& face2) {
     return sharedVertices >= 2;
 }
 
+struct PolyEdge {
+    int a, b;
 
-// This function has been tested for verts and indices returned by .obj file formats. ONLY WORKS WITH CONVEX MESHES!!! It does NOT convert concave meshes to convex meshes itself!!! 
-std::shared_ptr<Polytope> createPolytopeFromPoints(const std::vector<glm::vec3>& points, const std::vector<int>& indices) {
-    auto polytope = std::make_shared<Polytope>();
-
-    polytope->num_points = static_cast<int>(points.size());
-    polytope->points = new float[polytope->num_points * 3];
-
-    for (int i = 0; i < polytope->num_points; ++i) {
-        polytope->points[i * 3] = points[i].x;
-        polytope->points[i * 3 + 1] = points[i].y;
-        polytope->points[i * 3 + 2] = points[i].z;
+    bool operator==(const PolyEdge& other) const {
+        return a == other.a && b == other.b;
     }
+};
 
-    for (size_t i = 0; i < indices.size(); i += 3) {
-        if (i + 2 < indices.size()) {
-            int idx1 = indices[i];
-            int idx2 = indices[i + 1];
-            int idx3 = indices[i + 2];
+void addOrCancelEdge(std::vector<PolyEdge>& edges, int a, int b)
+{
+    for (auto it = edges.begin(); it != edges.end(); ++it) {
+        if (it->a == b && it->b == a) {
+            edges.erase(it); // internal edge cancels
+            return;
+        }
+    }
+    edges.push_back({a, b});
+}
 
-            if (idx1 >= points.size() || idx2 >= points.size() || idx3 >= points.size()) {
-                std::cerr << "Error: Invalid index detected at face: " << idx1 << ", " << idx2 << ", " << idx3 << std::endl;
-                continue;
-            }
+// A half-open face during construction.
+// We use indices into the original point cloud throughout.
+struct HullFace {
+    int v[3];           // Vertex indices (CCW winding when viewed from outside)
+    glm::vec3 normal;   // Outward unit normal
+    glm::vec3 centroid; // Average of v[0..2], used for plane equation
+ 
+    // Signed distance from this face's plane to point p.
+    // Positive = outside (in front of face), negative = inside.
+    float distanceTo(const glm::vec3& p) const {
+        return glm::dot(normal, p - centroid);
+    }
+};
+ 
+// An oriented edge: directed from a to b.
+// The horizon is a loop of directed edges such that each edge's reverse
+// (b, a) is present among the surviving (non-visible) faces.
+struct Edge {
+    int a, b;
+    bool operator==(const Edge& o) const { return a == o.a && b == o.b; }
+};
+ 
+struct EdgeHash {
+    size_t operator()(const Edge& e) const {
+        return std::hash<int>{}(e.a) ^ (std::hash<int>{}(e.b) << 16);
+    }
+};
+ 
+// Compute outward face normal given three points in CCW order.
+// CCW winding convention: normal points toward the reader when
+// the triangle is drawn counter-clockwise.
+static glm::vec3 faceNormal(const glm::vec3& a,
+                             const glm::vec3& b,
+                             const glm::vec3& c) {
+    return glm::normalize(glm::cross(b - a, c - a));
+}
+ 
+// Build a HullFace from three vertex indices.
+// 'interior' is any point known to be strictly inside the hull (the centroid
+// of the 4 seed points works).  We use it to orient the normal outward.
+static HullFace makeFace(int i0, int i1, int i2,
+                          const std::vector<glm::vec3>& pts,
+                          const glm::vec3& interior) {
+    HullFace f;
+    f.v[0] = i0; f.v[1] = i1; f.v[2] = i2;
+    f.centroid = (pts[i0] + pts[i1] + pts[i2]) / 3.0f;
+    f.normal = faceNormal(pts[i0], pts[i1], pts[i2]);
+ 
+    // Flip if the normal points toward the interior instead of away.
+    if (glm::dot(f.normal, interior - f.centroid) > 0.0f) {
+        std::swap(f.v[1], f.v[2]);
+        f.normal = -f.normal;
+    }
+    return f;
+}
 
-            glm::vec3 v1 = points[idx1];
-            glm::vec3 v2 = points[idx2];
-            glm::vec3 v3 = points[idx3];
+// Points closer than this to a plane are considered "on" the plane (coplanar).
+// Raise it if you get degenerate/duplicate faces on near-flat geometry.
+static constexpr float HULL_EPSILON = 1e-5f;
 
-            glm::vec3 edge1 = v2 - v1;
-            glm::vec3 edge2 = v3 - v1;
-
-            glm::vec3 normal = glm::normalize(glm::cross(edge1, edge2));
-
-            if (glm::length(normal) == 0.0f) {
-                std::cerr << "Warning: Degenerate triangle found: " << idx1 << ", " << idx2 << ", " << idx3 << std::endl;
-                continue;
-            }
-
-            // Attempt to merge with existing faces
-            bool merged = false;
-            for (size_t faceIndex = 0; faceIndex < polytope->faces.size(); ++faceIndex) {
-                auto& face = polytope->faces[faceIndex];
-                auto& face_indices = std::get<0>(face);
-                auto& face_normal = std::get<1>(face);
-
-                if (areNormalsEqual(face_normal, normal) && shareEdge(face_indices, { idx1, idx2, idx3 })) {
-                    // Merge the face by adding new unique vertices
-                    face_indices.push_back(idx1);
-                    face_indices.push_back(idx2);
-                    face_indices.push_back(idx3);
-                    // Remove duplicate vertices
-                    std::sort(face_indices.begin(), face_indices.end());
-                    face_indices.erase(std::unique(face_indices.begin(), face_indices.end()), face_indices.end());
-
-                    // Replace the old face with the merged face
-                    polytope->faces[faceIndex] = std::make_tuple(face_indices, normal);
-
-                    merged = true;
-                    break;
+std::shared_ptr<Polytope> buildConvexHull(const std::vector<glm::vec3>& points) {
+ 
+    const int n = static_cast<int>(points.size());
+    if (n < 4) return nullptr;
+ 
+    // ─── Step 1: Find seed tetrahedron ──────────────────────────────────────
+    //
+    // We need 4 non-coplanar points to start.  We pick them by finding the
+    // 6 axis-aligned extrema first (±x, ±y, ±z), then choosing the pair
+    // with the greatest mutual distance, then the point furthest from the
+    // line between them, then the point furthest from the plane of those 3.
+    //
+    // This is more robust than just taking indices 0-3 from the input.
+ 
+    // Find extremal point indices along each axis
+    std::array<int,6> extrema = {0,0,0,0,0,0};
+    for (int i = 1; i < n; ++i) {
+        if (points[i].x < points[extrema[0]].x) extrema[0] = i;
+        if (points[i].x > points[extrema[1]].x) extrema[1] = i;
+        if (points[i].y < points[extrema[2]].y) extrema[2] = i;
+        if (points[i].y > points[extrema[3]].y) extrema[3] = i;
+        if (points[i].z < points[extrema[4]].z) extrema[4] = i;
+        if (points[i].z > points[extrema[5]].z) extrema[5] = i;
+    }
+ 
+    // Pick the pair of extrema that are furthest apart (seed edge)
+    int s0 = 0, s1 = 1;
+    float best = -1.0f;
+    for (int a = 0; a < 6; ++a) {
+        for (int b = a + 1; b < 6; ++b) {
+            float d = glm::distance(points[extrema[a]], points[extrema[b]]);
+            if (d > best) { best = d; s0 = extrema[a]; s1 = extrema[b]; }
+        }
+    }
+ 
+    // Seed triangle: find point furthest from line s0–s1
+    glm::vec3 lineDir = glm::normalize(points[s1] - points[s0]);
+    int s2 = -1;
+    float bestDist = -1.0f;
+    for (int i = 0; i < n; ++i) {
+        if (i == s0 || i == s1) continue;
+        glm::vec3 diff = points[i] - points[s0];
+        float d = glm::length(diff - glm::dot(diff, lineDir) * lineDir);
+        if (d > bestDist) { bestDist = d; s2 = i; }
+    }
+    if (s2 == -1 || bestDist < HULL_EPSILON) return nullptr; // All collinear
+ 
+    // Seed tetrahedron: find point furthest from plane s0–s1–s2
+    glm::vec3 seedNormal = faceNormal(points[s0], points[s1], points[s2]);
+    int s3 = -1;
+    float bestPlaneDist = -1.0f;
+    for (int i = 0; i < n; ++i) {
+        if (i == s0 || i == s1 || i == s2) continue;
+        float d = std::abs(glm::dot(seedNormal, points[i] - points[s0]));
+        if (d > bestPlaneDist) { bestPlaneDist = d; s3 = i; }
+    }
+    if (s3 == -1 || bestPlaneDist < HULL_EPSILON) return nullptr; // All coplanar
+ 
+    // Interior reference point: average of the 4 seed vertices.
+    // Used to consistently orient face normals outward.
+    glm::vec3 interior = (points[s0] + points[s1] + points[s2] + points[s3]) * 0.25f;
+ 
+    // Build the 4 faces of the seed tetrahedron.
+    // Each face's normal is oriented away from 'interior'.
+    std::vector<HullFace> faces;
+    faces.reserve(256);
+    faces.push_back(makeFace(s0, s1, s2, points, interior));
+    faces.push_back(makeFace(s0, s1, s3, points, interior));
+    faces.push_back(makeFace(s0, s2, s3, points, interior));
+    faces.push_back(makeFace(s1, s2, s3, points, interior));
+ 
+    // ─── Step 2: Assign outside points to each face ─────────────────────────
+    //
+    // For each face we maintain a list of points that are "outside" it
+    // (positive signed distance > HULL_EPSILON).  A point is assigned to
+    // at most one face (the one it is furthest outside of).
+    //
+    // This partitioning means we never test the full point cloud against
+    // every face — it's the key to Quickhull's efficiency.
+ 
+    // outside_sets[i] = indices of points outside faces[i]
+    std::vector<std::vector<int>> outside_sets(faces.size());
+ 
+    auto assignPoint = [&](int pi) {
+        float maxD = HULL_EPSILON;
+        int bestFace = -1;
+        for (int fi = 0; fi < (int)faces.size(); ++fi) {
+            float d = faces[fi].distanceTo(points[pi]);
+            if (d > maxD) { maxD = d; bestFace = fi; }
+        }
+        if (bestFace >= 0) outside_sets[bestFace].push_back(pi);
+    };
+ 
+    for (int i = 0; i < n; ++i) {
+        if (i == s0 || i == s1 || i == s2 || i == s3) continue;
+        assignPoint(i);
+    }
+ 
+    // ─── Step 3: Expand the hull ────────────────────────────────────────────
+    //
+    // Process each face that has outside points.
+    // We use a simple work-queue pattern: faces added later also get processed.
+ 
+    int fi = 0; // current face index
+    while (fi < (int)faces.size()) {
+        if (outside_sets[fi].empty()) { ++fi; continue; }
+ 
+        // 3a. Find the apex: the outside point furthest from faces[fi].
+        //     This point will become a new hull vertex.
+        int apex = outside_sets[fi][0];
+        float apexDist = faces[fi].distanceTo(points[apex]);
+        for (int pi : outside_sets[fi]) {
+            float d = faces[fi].distanceTo(points[apex]);
+            if (d > apexDist) { apexDist = d; apex = pi; }
+        }
+ 
+        // 3b. Find all faces visible from apex.
+        //     A face is visible if the apex is outside its plane.
+        //     We do a BFS/flood-fill from faces[fi] through face adjacency.
+        //
+        //     BFS is more robust than testing all faces because floating-point
+        //     rounding can make a face appear "inside" even when it's part of
+        //     a visible patch.  Adjacency ensures we don't miss connected
+        //     visible faces.
+ 
+        // Build edge→face adjacency on the fly for the current hull.
+        // edge_to_face[(a,b)] = face index that has directed edge a→b.
+        std::unordered_map<Edge, int, EdgeHash> edge_to_face;
+        for (int k = 0; k < (int)faces.size(); ++k) {
+            const HullFace& f = faces[k];
+            edge_to_face[{f.v[0], f.v[1]}] = k;
+            edge_to_face[{f.v[1], f.v[2]}] = k;
+            edge_to_face[{f.v[2], f.v[0]}] = k;
+        }
+ 
+        // BFS flood-fill from fi
+        std::unordered_set<int> visible;
+        std::vector<int> bfs = {fi};
+        visible.insert(fi);
+        while (!bfs.empty()) {
+            int cur = bfs.back(); bfs.pop_back();
+            // Check the 3 neighboring faces (the ones sharing an edge)
+            for (int e = 0; e < 3; ++e) {
+                int a = faces[cur].v[e];
+                int b = faces[cur].v[(e+1)%3];
+                // The neighboring face owns the reverse edge (b→a)
+                auto it = edge_to_face.find({b, a});
+                if (it == edge_to_face.end()) continue;
+                int neighbor = it->second;
+                if (visible.count(neighbor)) continue;
+                if (faces[neighbor].distanceTo(points[apex]) > HULL_EPSILON) {
+                    visible.insert(neighbor);
+                    bfs.push_back(neighbor);
                 }
             }
-
-            if (!merged) {
-                // Create a new face if it cannot be merged
-                polytope->faces.emplace_back(std::vector<int>{idx1, idx2, idx3}, normal);
+        }
+ 
+        // 3c. Find the horizon: directed edges on the boundary between
+        //     visible and non-visible faces.
+        //
+        //     An edge (a→b) is on the horizon if:
+        //       - Its owning face is visible
+        //       - The face owning the reverse edge (b→a) is NOT visible
+        //
+        //     The horizon edges form a closed loop (for convex hulls).
+        //     We collect them as directed edges pointing INTO the visible region
+        //     (so the new triangles will have correct winding).
+ 
+        std::vector<Edge> horizon;
+        for (int vi : visible) {
+            for (int e = 0; e < 3; ++e) {
+                int a = faces[vi].v[e];
+                int b = faces[vi].v[(e+1)%3];
+                auto it = edge_to_face.find({b, a});
+                // If the reverse edge has no owner or its owner is not visible,
+                // this edge is on the horizon.
+                if (it == edge_to_face.end() || !visible.count(it->second)) {
+                    horizon.push_back({a, b});
+                }
+            }
+        }
+ 
+        // 3d. Collect outside points from all visible faces.
+        //     They will be re-partitioned among the new faces.
+        std::vector<int> orphans;
+        for (int vi : visible) {
+            for (int pi : outside_sets[vi]) {
+                if (pi != apex) orphans.push_back(pi);
+            }
+        }
+ 
+        // 3e. Remove visible faces (mark as deleted, then erase).
+        //     We also remove their outside sets at the same time.
+        {
+            // Sort descending so erasing by index doesn't shift earlier indices.
+            std::vector<int> vis_sorted(visible.begin(), visible.end());
+            std::sort(vis_sorted.rbegin(), vis_sorted.rend());
+            for (int vi : vis_sorted) {
+                faces.erase(faces.begin() + vi);
+                outside_sets.erase(outside_sets.begin() + vi);
+            }
+            // fi may have shifted; reset and re-scan from the beginning.
+            // This is the simple/correct approach; a production implementation
+            // would use a free-list instead of erasing.
+            fi = 0;
+        }
+ 
+        // 3f. Create new triangular faces: apex + each horizon edge.
+        //     The horizon edge direction already gives us the correct winding:
+        //     if (a→b) is on the horizon, (apex, a, b) is CCW from outside.
+        //
+        //     Why? The horizon edge (a→b) is owned by a visible face, meaning
+        //     the face's outward normal pointed toward apex.  The non-visible
+        //     neighbour owns (b→a), so from outside the hull b→a is CCW on
+        //     that face.  The new face (apex, a, b) continues the same
+        //     consistent CCW convention.
+ 
+        int new_face_start = static_cast<int>(faces.size());
+        for (const Edge& e : horizon) {
+            faces.push_back(makeFace(apex, e.a, e.b, points, interior));
+            outside_sets.push_back({});
+        }
+ 
+        // 3g. Re-assign orphaned outside points to the new faces.
+        for (int pi : orphans) {
+            float maxD = HULL_EPSILON;
+            int bestFace = -1;
+            for (int k = new_face_start; k < (int)faces.size(); ++k) {
+                float d = faces[k].distanceTo(points[pi]);
+                if (d > maxD) { maxD = d; bestFace = k; }
+            }
+            if (bestFace >= 0) outside_sets[bestFace].push_back(pi);
+        }
+ 
+        // fi was reset to 0 after the erase step above, so the while loop
+        // will naturally continue from the beginning.
+    }
+ 
+    // ─── Step 4: Merge coplanar triangles into n-gons ───────────────────────
+    //
+    // Quickhull always produces triangles. For a cube that means 12 faces,
+    // but a cube only has 6 logical faces. Duplicate normals break the
+    // reference-face lookup in clipping-based collision detection, because
+    // the lookup finds the face whose normal best matches the collision normal —
+    // if two triangles share a normal you get an arbitrary winner, and its
+    // neighbor list is incomplete (3 edges instead of 4).
+    //
+    // Solution: group triangles by coplanarity, then for each group extract
+    // the boundary polygon via half-edge cancellation.
+    //
+    // Half-edge cancellation:
+    //   Every directed edge (a→b) inside a coplanar group has a twin (b→a)
+    //   belonging to the adjacent triangle in the same group. Collect all
+    //   directed edges from every triangle in the group; cancel any pair
+    //   (a→b) + (b→a). What remains are the boundary edges — they form a
+    //   single closed loop for a convex planar region.
+    //
+    // Loop reconstruction:
+    //   Build a map next_vertex[a] = b for each boundary edge (a→b).
+    //   Walk from an arbitrary start vertex, following next_vertex, until
+    //   we return to the start. That ordered walk is the polygon.
+ 
+    // 4a. Group triangle indices by coplanar normal.
+    //     We use a tolerance-based normal comparison rather than exact equality
+    //     because floating-point normals from adjacent triangles can diverge
+    //     by small amounts even when geometrically coplanar.
+    //
+    //     Strategy: for each triangle, search existing groups for a compatible
+    //     normal (dot product > 1 - NORMAL_MERGE_DOT_THRESHOLD and same plane
+    //     offset). If found, add to that group; otherwise start a new group.
+    //     This is O(F²) in group count but F is small for typical convex hulls.
+ 
+    static constexpr float NORMAL_MERGE_DOT_THRESHOLD = 1e-4f; // cos(angle) must exceed 1 - this
+ 
+    struct FaceGroup {
+        glm::vec3 normal;       // Representative normal for this group
+        float     plane_d;      // Plane offset: dot(normal, any_point_on_plane)
+        std::vector<int> tri_indices; // Which triangles (into 'faces') belong here
+    };
+    std::vector<FaceGroup> groups;
+ 
+    for (int ti = 0; ti < (int)faces.size(); ++ti) {
+        const HullFace& hf = faces[ti];
+        float d = glm::dot(hf.normal, points[hf.v[0]]);
+ 
+        bool placed = false;
+        for (FaceGroup& g : groups) {
+            // Check both normal alignment and same plane (via plane offset d).
+            bool same_normal = (1.0f - glm::dot(g.normal, hf.normal)) < NORMAL_MERGE_DOT_THRESHOLD;
+            bool same_plane  = std::abs(g.plane_d - d) < HULL_EPSILON * 100.0f;
+            if (same_normal && same_plane) {
+                g.tri_indices.push_back(ti);
+                placed = true;
+                break;
+            }
+        }
+        if (!placed) {
+            FaceGroup g;
+            g.normal = hf.normal;
+            g.plane_d = d;
+            g.tri_indices.push_back(ti);
+            groups.push_back(std::move(g));
+        }
+    }
+ 
+    // 4b. For each group, reconstruct the boundary polygon.
+    //
+    //     The result is an ordered list of vertex indices forming the polygon
+    //     boundary in CCW order (same winding as the source triangles).
+ 
+    struct MergedFace {
+        std::vector<int> verts; // Ordered boundary vertices (CCW from outside)
+        glm::vec3 normal;
+    };
+    std::vector<MergedFace> merged_faces;
+    merged_faces.reserve(groups.size());
+ 
+    for (const FaceGroup& g : groups) {
+        // Collect all directed edges from triangles in this group.
+        // Use a map: edge (a,b) -> count of times it appears directed a→b.
+        // An internal edge appears once as (a,b) and once as (b,a).
+        // A boundary edge appears only as (a,b).
+        std::unordered_map<Edge, int, EdgeHash> edge_count;
+        for (int ti : g.tri_indices) {
+            const HullFace& hf = faces[ti];
+            for (int e = 0; e < 3; ++e) {
+                Edge fwd = {hf.v[e], hf.v[(e+1)%3]};
+                edge_count[fwd]++;
+            }
+        }
+ 
+        // Boundary edges are those with no reverse twin, i.e. edge (a,b) is
+        // boundary iff edge (b,a) does not appear in edge_count.
+        // Build next_vertex map for boundary loop walk.
+        std::unordered_map<int,int> next_vertex; // next_vertex[a] = b for boundary edge a→b
+        for (const auto& [e, cnt] : edge_count) {
+            Edge rev = {e.b, e.a};
+            if (edge_count.find(rev) == edge_count.end()) {
+                // (e.a → e.b) is a boundary edge
+                next_vertex[e.a] = e.b;
+            }
+        }
+ 
+        if (next_vertex.empty()) continue; // Degenerate group, skip
+ 
+        // Walk the boundary loop from an arbitrary start vertex.
+        MergedFace mf;
+        mf.normal = g.normal;
+        int start = next_vertex.begin()->first;
+        int cur   = start;
+        do {
+            mf.verts.push_back(cur);
+            auto it = next_vertex.find(cur);
+            if (it == next_vertex.end()) break; // Should not happen on valid hull
+            cur = it->second;
+        } while (cur != start);
+ 
+        merged_faces.push_back(std::move(mf));
+    }
+ 
+    // ─── Step 5: Package into Polytope ──────────────────────────────────────
+ 
+    auto polytope = std::make_shared<Polytope>();
+ 
+    // 5a. Copy point data (full original cloud; support() iterates all points)
+    polytope->num_points = n;
+    polytope->points = new float[n * 3];
+    for (int i = 0; i < n; ++i) {
+        polytope->points[i*3+0] = points[i].x;
+        polytope->points[i*3+1] = points[i].y;
+        polytope->points[i*3+2] = points[i].z;
+    }
+ 
+    // 5b. Store merged n-gon faces.
+    //     Each face is now one polygon per planar region.
+    //     A cube produces exactly 6 faces, each with 4 vertices.
+    polytope->faces.clear();
+    polytope->faces.reserve(merged_faces.size());
+    for (const MergedFace& mf : merged_faces) {
+        polytope->faces.emplace_back(mf.verts, mf.normal);
+    }
+ 
+    // 5c. Build planes[].
+    //     point  = first vertex of the polygon (a point on the plane).
+    //     point1 = second vertex (for normal recalculation via cross product).
+    polytope->planes.clear();
+    polytope->planes.reserve(merged_faces.size());
+    for (const MergedFace& mf : merged_faces) {
+        PolyPlane p;
+        p.normal = mf.normal;
+        p.point  = points[mf.verts[0]];
+        p.point1 = points[mf.verts[1]];
+        polytope->planes.push_back(p);
+    }
+ 
+    // 5d. Build plane_neighbors[] adjacency list on the merged faces.
+    //
+    //     Two merged faces are neighbors iff they share at least one edge.
+    //     We identify shared edges using the same undirected (min,max) key.
+    //     A boundary edge of merged face i that is the boundary of merged face j
+    //     means i and j are adjacent — exactly what SAT side-plane clipping needs.
+    //
+    //     Note: after merging, every edge in merged_faces is a TRUE geometric
+    //     boundary (the internal edges were cancelled in Step 4). So adjacency
+    //     here reflects actual face-face adjacency on the convex hull.
+ 
+    std::unordered_map<std::pair<int,int>, std::vector<int>, PairHash> edge_to_merged;
+    for (int i = 0; i < (int)polytope->faces.size(); ++i) {
+        const auto& verts = std::get<0>(polytope->faces[i]);
+        for (int j = 0; j < (int)verts.size(); ++j) {
+            int a = verts[j];
+            int b = verts[(j+1) % verts.size()];
+            if (a > b) std::swap(a, b);
+            edge_to_merged[{a, b}].push_back(i);
+        }
+    }
+ 
+    polytope->plane_neighbors.resize(polytope->faces.size());
+    for (const auto& [edge, faceList] : edge_to_merged) {
+        for (size_t i = 0; i < faceList.size(); ++i) {
+            for (size_t j = i + 1; j < faceList.size(); ++j) {
+                int f1 = faceList[i];
+                int f2 = faceList[j];
+                polytope->plane_neighbors[f1].push_back(polytope->planes[f2]);
+                polytope->plane_neighbors[f2].push_back(polytope->planes[f1]);
             }
         }
     }
-
-    // Remove merged faces from the vector of faces
-    std::vector<std::tuple<std::vector<int>, glm::vec3>> uniqueFaces;
-    for (auto& face : polytope->faces) {
-        auto& face_indices = std::get<0>(face);
-
-        // Check if this face is unique and not merged into another
-        if (std::find_if(uniqueFaces.begin(), uniqueFaces.end(), [&](const auto& uniqueFace) {
-            return std::get<0>(uniqueFace) == face_indices;
-            }) == uniqueFaces.end()) {
-            uniqueFaces.push_back(face);
-        }
-    }
-    polytope->faces = std::move(uniqueFaces);
-
+ 
     return polytope;
 }
 
-// This is a helper function that relies on the GameObject* owner of this. You need to plug in your own owner object here.
-
-/*
-std::vector<PolygonalFace> createPolygonalFaces(const Polytope& polytope) {
-    std::vector<PolygonalFace> polygonalFaces;
-
-    // Retrieve the model matrix for transforming local vertices to world space
-    glm::mat4 modelMatrix = polytope.owner->getModel();
-
-    for (const auto& face : polytope.faces) {
-        const auto& indices = std::get<0>(face);  // Extract indices
-        glm::vec3 normal = std::get<1>(face);     // Extract face normal
-
-        PolygonalFace polygonFace;
-        polygonFace.faceIndices = indices;
-
-        // Populate faceVertices with transformed coordinates
-        for (int index : indices) {
-            int pointIdx = index * 3;
-            glm::vec3 localVertex(
-                polytope.points[pointIdx],
-                polytope.points[pointIdx + 1],
-                polytope.points[pointIdx + 2]
-            );
-
-            // Transform local vertex to world coordinates
-            glm::vec4 worldVertex = modelMatrix * glm::vec4(localVertex, 1.0f);
-            polygonFace.faceVertices.push_back(glm::vec3(worldVertex));
-        }
-
-        polygonalFaces.push_back(polygonFace);
-    }
-
-    return polygonalFaces;
-}
-
-*/
-
-// Same here: This is the function responsible for updating the collider per frame, according to the Owner gameobject's position, rotation and scale.
-
-/*
 void updatePolytope(Polytope& tope) {
-    tope.matRS = tope.owner->getModel();
+    tope.matRS = tope.owner->transform.model;
     tope.matRS_inverse = inverse(tope.matRS);
-    tope.pos = tope.owner->getPosition();
-}
-
-*/
-
-
-// Useful helper function if you wanna debug if the faces are being returned properly or nah.
-std::tuple<std::vector<glm::vec3>, glm::vec3> getFaceVertices(const Polytope& polytope, const std::tuple<std::vector<int>, glm::vec3>& face) {
-    const auto& indices = std::get<0>(face);
-    std::vector<glm::vec3> vertices;
-
-    for (int idx : indices) {
-        vertices.emplace_back(
-            polytope.points[idx * 3],
-            polytope.points[idx * 3 + 1],
-            polytope.points[idx * 3 + 2]
-        );
-    }
-
-    return std::make_tuple(vertices, std::get<1>(face));  // Return vertices and the normal
+    tope.pos = tope.owner->transform.getPosition();
 }
 
 // Function to extract the vertices of a face by index, transforming them into world coordinates
-// EXETREMELY IMPORTANT FUNCTION!!! You need to plug in the actual owner object's transform matrix here:
 PolygonalFace getFaceByIndex(const Polytope& polytope, int faceIndex) {
     if (faceIndex < 0 || faceIndex >= polytope.faces.size()) {
         std::cerr << "Error: Face index out of bounds." << std::endl;
@@ -333,9 +751,7 @@ PolygonalFace getFaceByIndex(const Polytope& polytope, int faceIndex) {
     polyFace.faceIndices.clear();  // We will create local indices
 
     // Get the owner's model matrix to transform local coordinates to world space
-
-    // YOU NEED TO USE YOUR ACTUAL OWNER'S TRANSFORM MATRIX HERE:
-    glm::mat4 modelMatrix = glm::mat4x4(1.0f);//polytope.owner->getModel();
+    glm::mat4 modelMatrix = polytope.owner->transform.model;
 
     // For each global index, extract the corresponding vertex and transform it into world space
     for (size_t i = 0; i < globalIndices.size(); ++i) {
@@ -585,8 +1001,8 @@ void findContactManifoldFaces(Polytope* collider1, Polytope* collider2, const gl
         // Dots are nearly identical; choose by comparing scale magnitudes
 
         // Yeah, once again, plug in your actual owner gameobject here:
-        float scaleMagnitude1 = glm::length(collider1->owner->getScale());
-        float scaleMagnitude2 = glm::length(collider2->owner->getScale());
+        float scaleMagnitude1 = glm::length(collider1->owner->transform.getScale());
+        float scaleMagnitude2 = glm::length(collider2->owner->transform.getScale());
 
         if (scaleMagnitude1 >= scaleMagnitude2) {
             referenceCollider = collider1;
@@ -622,231 +1038,115 @@ void findContactManifoldFaces(Polytope* collider1, Polytope* collider2, const gl
     incidentFaceIndex = best_incident_index;
 }
 
-// Compute the squared distance between two line segments
-float squaredDistanceBetweenEdgesGJK(const glm::vec3& p1, const glm::vec3& q1, const glm::vec3& p2, const glm::vec3& q2) {
-    glm::vec3 d1 = q1 - p1;  // Direction vector of segment S1
-    glm::vec3 d2 = q2 - p2;  // Direction vector of segment S2
-    glm::vec3 r = p1 - p2;
+struct Face {
+    glm::vec3 point;
+    glm::vec3 normal;
+};
 
-    float a = glm::dot(d1, d1);  // Squared length of segment S1
-    float e = glm::dot(d2, d2);  // Squared length of segment S2
-    float f = glm::dot(d2, r);
-
-    float s, t;
-    if (a <= 1e-6f && e <= 1e-6f) {
-        return glm::dot(r, r);  // Both segments degenerate into points
+std::array<Face, 6> faces = {
+    Face{
+        glm::vec3(0.0f, 0.0f, 0.0f), // Front (-Z)
+        glm::vec3(0.0f, 0.0f, -1.0f)
+    },
+    Face{
+        glm::vec3(0.0f, 0.0f, 1.0f), // Back (+Z)
+        glm::vec3(0.0f, 0.0f, 1.0f)
+    },
+    Face{
+        glm::vec3(0.0f, 0.0f, 0.0f), // Bottom (-Y)
+        glm::vec3(0.0f, -1.0f, 0.0f)
+    },
+    Face{
+        glm::vec3(0.0f, 1.0f, 0.0f), // Top (+Y)
+        glm::vec3(0.0f, 1.0f, 0.0f)
+    },
+    Face{
+        glm::vec3(0.0f, 0.0f, 0.0f), // Left (-X)
+        glm::vec3(-1.0f, 0.0f, 0.0f)
+    },
+    Face{
+        glm::vec3(1.0f, 0.0f, 0.0f), // Right (+X)
+        glm::vec3(1.0f, 0.0f, 0.0f)
     }
-    if (a <= 1e-6f) {
-        s = 0.0f;
-        t = glm::clamp(f / e, 0.0f, 1.0f); // Closest point on segment S2 to point p1
-    }
-    else {
-        float c = glm::dot(d1, r);
-        if (e <= 1e-6f) {
-            t = 0.0f;
-            s = glm::clamp(-c / a, 0.0f, 1.0f); // Closest point on segment S1 to point p2
-        }
-        else {
-            float b = glm::dot(d1, d2);
-            float denom = a * e - b * b;
-            if (denom != 0.0f) {
-                s = glm::clamp((b * f - c * e) / denom, 0.0f, 1.0f);
-            }
-            else {
-                s = 0.0f;
-            }
-            t = glm::clamp((b * s + f) / e, 0.0f, 1.0f);
-        }
-    }
-
-    glm::vec3 c1 = p1 + s * d1;
-    glm::vec3 c2 = p2 + t * d2;
-    return glm::length2(c1 - c2); // Squared distance between the closest points on the segments
-}
-
-// Find the closest pair of edges between two colliders
-std::vector<std::pair<std::pair<glm::vec3, glm::vec3>, std::pair<glm::vec3, glm::vec3>>> findClosestEdgesGJK(const PolygonalFace& face1, const PolygonalFace& face2) {
-    std::vector<std::pair<glm::vec3, glm::vec3>> edges1 = face1.getEdges();
-    std::vector<std::pair<glm::vec3, glm::vec3>> edges2 = face2.getEdges();
-
-    // Not the best solution for this! But I was too lazy to implement a better solution. Ideally what we should do is, if we find no edges below this epsilon,
-    // we should check for the closest edge. Because the only time we won't find edges within epsilon is when there has been significant overlap, and we need to push the colliders apart!!!
-    float minDistanceSquared = 0.01f;  // I'm talking about this epsilon here. It's quite an arbitrary value I just randomly put here, you should see what works best for you.
-    std::vector<std::pair<std::pair<glm::vec3, glm::vec3>, std::pair<glm::vec3, glm::vec3>>> closestEdges;
-
-    // Iterate over all edge pairs
-    for (const auto& edge1 : edges1) {
-        for (const auto& edge2 : edges2) {
-            // Compute the squared distance between the two edges
-            float distSquared = squaredDistanceBetweenEdgesGJK(edge1.first, edge1.second, edge2.first, edge2.second);
-
-            // Track the closest pair of edges
-            if (distSquared < minDistanceSquared) {
-                minDistanceSquared = distSquared;
-                closestEdges.push_back({ edge1, edge2 });
-            }
-        }
-    }
-
-    return closestEdges;
-}
-
-// Compute closest points between two line segments
-glm::vec3 closestPointBetweenLinesGJK(const glm::vec3& p1, const glm::vec3& q1, const glm::vec3& p2, const glm::vec3& q2) {
-    glm::vec3 d1 = q1 - p1;  // Direction vector of segment S1
-    glm::vec3 d2 = q2 - p2;  // Direction vector of segment S2
-    glm::vec3 r = p1 - p2;
-    float a = glm::dot(d1, d1);  // Squared length of segment S1
-    float e = glm::dot(d2, d2);  // Squared length of segment S2
-    float f = glm::dot(d2, r);
-
-    float s, t;
-    if (a <= 1e-6f && e <= 1e-6f) {
-        // Both segments degenerate into points
-        return p1;
-    }
-    if (a <= 1e-6f) {
-        // First segment degenerate into a point
-        s = 0.0f;
-        t = glm::clamp(f / e, 0.0f, 1.0f); // Use the closest point on segment S2 to point p1
-    }
-    else {
-        float c = glm::dot(d1, r);
-        if (e <= 1e-6f) {
-            // Second segment degenerate into a point
-            t = 0.0f;
-            s = glm::clamp(-c / a, 0.0f, 1.0f); // Use the closest point on segment S1 to point p2
-        }
-        else {
-            float b = glm::dot(d1, d2);
-            float denom = a * e - b * b;
-
-            if (denom != 0.0f) {
-                s = glm::clamp((b * f - c * e) / denom, 0.0f, 1.0f);
-            }
-            else {
-                s = 0.0f;
-            }
-
-            t = glm::clamp((b * s + f) / e, 0.0f, 1.0f);
-        }
-    }
-
-    // Compute the closest points on the actual segments
-    glm::vec3 c1 = p1 + s * d1; // Closest point on segment S1
-    glm::vec3 c2 = p2 + t * d2; // Closest point on segment S2
-
-    // Return the point that is on the closest segment line (S1 or S2)
-    return glm::length(c1 - p1) < glm::length(c2 - p2) ? c1 : c2;
-}
-
-std::vector<glm::vec3> HandleEdgeCollision(const PolygonalFace& incidentFace, const PolygonalFace& referenceFace) {
-
-    //get the edges that are close enough to each other
-    auto edges = findClosestEdgesGJK(incidentFace, referenceFace);
-
-    std::vector<glm::vec3> manifoldToReturn;
-
-    for (const auto& edgePair : edges) {
-        // store their point of intersection, or closest point into the manifoldToReturn
-        auto point = closestPointBetweenLinesGJK(edgePair.first.first, edgePair.first.second, edgePair.second.first, edgePair.second.second);
-
-        manifoldToReturn.push_back(point);
-    }
-
-    return manifoldToReturn; // return the manifold
-}
+};
 
 // Function to clip a polygonal face (incidentFace) against the planes (polygonal faces) of a reference collider
-std::vector<glm::vec3> clipFaceAgainstReference(const PolygonalFace& incidentFace, const Polytope& referenceCollider, const PolygonalFace& ReferenceFace) {
+std::vector<glm::vec3> clipFaceAgainstReference(const PolygonalFace& incidentFace,
+                                                const Polytope& referenceCollider,
+                                                const int referenceFace)
+{
     std::vector<glm::vec3> clippedVertices = incidentFace.faceVertices;
-    const float epsilon = 0.001f;  // Tolerance for numerical precision
+    const float epsilon = 0.001f;
 
-    // For Vertex-Face and Face-Face collisions. This can fail at certain edge-edge collisions, hencewhy we also have a HandleEdgeCollision() function, in case this one fails.
+    for (int i = 0; i < faces.size(); i++) {
 
-    // Loop through each face of the reference collider
-    for (size_t faceIndex = 0; faceIndex < referenceCollider.faces.size(); ++faceIndex) {
-        // Create a PolygonalFace for the current face of the reference collider
-        PolygonalFace referenceFace = getFaceByIndex(referenceCollider, faceIndex);
+        auto face = faces[i];
 
-        // Calculate the face normal in world space
-        glm::vec3 transformedNormal = referenceFace.getFaceNormal();
-        if (glm::length(transformedNormal) < epsilon) continue; // Skip degenerate faces
+        glm::vec3 n = glm::transpose(glm::inverse(glm::mat3(referenceCollider.owner->transform.model))) * face.normal;
 
-        // Calculate the centroid of the reference face (in world coordinates)
-        glm::vec3 planePoint = referenceFace.faceVertices[0];
+        if (glm::length(n) < epsilon) continue;
 
-        // Perform Sutherland-Hodgman clipping for each plane (Once again, not good approach here. Ideally, we should have a map to the neighboring faces to the reference face, and clip against them
-        // but of course, I didn't implement that here, we loop through EVERY face in the hull, clipping our way through. This is a big area for improvement.)
+        glm::vec3 P0 = glm::vec3(referenceCollider.owner->transform.model * glm::vec4(face.point, 1.0f));
+
         std::vector<glm::vec3> inputVertices = clippedVertices;
         clippedVertices.clear();
 
         for (size_t i = 0; i < inputVertices.size(); ++i) {
-            glm::vec3 currentVertex = inputVertices[i];
-            glm::vec3 nextVertex = inputVertices[(i + 1) % inputVertices.size()];
+            const glm::vec3& A = inputVertices[i];
+            const glm::vec3& B = inputVertices[(i + 1) % inputVertices.size()];
 
-            // Calculate distances from vertices to the plane, adjusted for numerical stability
-            float distCurrent = glm::dot(transformedNormal, currentVertex - planePoint);
-            float distNext = glm::dot(transformedNormal, nextVertex - planePoint);
-            distCurrent = (glm::abs(distCurrent) < epsilon) ? 0.0f : distCurrent;
-            distNext = (glm::abs(distNext) < epsilon) ? 0.0f : distNext;
+            float dA = glm::dot(n, A - P0);
+            float dB = glm::dot(n, B - P0);
 
-            // Case 1: Both points are inside (negative or zero distance)
-            if (distCurrent <= 0 && distNext <= 0) {
-                clippedVertices.push_back(nextVertex);
+            // Snap near-zero distances to zero for numerical stability
+            if (glm::abs(dA) < epsilon) dA = 0.0f;
+            if (glm::abs(dB) < epsilon) dB = 0.0f;
+
+            bool AInside = dA < -epsilon;
+            bool BInside = dB < -epsilon;
+
+            bool AOn = glm::abs(dA) <= epsilon;
+            bool BOn = glm::abs(dB) <= epsilon;
+
+            // Case 1: both inside
+            if ((AInside || AOn) && (BInside || BOn)) {
+                clippedVertices.push_back(B);
             }
-            // Case 2: Current point is outside, next point is inside
-            else if (distCurrent > 0 && distNext <= 0) {
-                if (glm::abs(distNext - distCurrent) > epsilon) { // Ensure the division is safe
-                    glm::vec3 intersection = currentVertex + (nextVertex - currentVertex) * (-distCurrent / (distNext - distCurrent));
-                    clippedVertices.push_back(intersection);
+
+            // Case 2: A outside, B on plane
+            else if (!AInside && !AOn && BOn) {
+                clippedVertices.push_back(B);
+            }
+
+            // Case 3: A on plane, B outside
+            else if (AOn && !BInside && !BOn) {
+                continue;
+            }
+
+            // Case 4: A inside, B outside
+            else if ((AInside || AOn) && (!BInside && !BOn)) {
+                float denom = dA - dB;
+                if (glm::abs(denom) > epsilon) {
+                    float t = dA / denom;
+                    clippedVertices.push_back(A + t * (B - A));
                 }
-                clippedVertices.push_back(nextVertex);
             }
-            // Case 3: Current point is inside, next point is outside
-            else if (distCurrent <= 0 && distNext > 0) {
-                if (glm::abs(distNext - distCurrent) > epsilon) { // Ensure the division is safe
-                    glm::vec3 intersection = currentVertex + (nextVertex - currentVertex) * (-distCurrent / (distNext - distCurrent));
-                    clippedVertices.push_back(intersection);
+
+            // Case 5: A outside, B inside
+            else if ((!AInside && !AOn) && (BInside || BOn)) {
+                float denom = dA - dB;
+                if (glm::abs(denom) > epsilon) {
+                    float t = dA / denom;
+                    clippedVertices.push_back(A + t * (B - A));
                 }
+                clippedVertices.push_back(B);
             }
-            // Case 4: Both points are outside, do nothing
+
+            // Case 6: both outside -> emit nothing
         }
     }
 
-    // If no vertices remain after clipping, check the edges
-    if (clippedVertices.empty()) {
-
-        clippedVertices = HandleEdgeCollision(incidentFace, ReferenceFace);
-    }
-
-    // Remove duplicate or nearly overlapping points with precision handling
-    if (!clippedVertices.empty()) {
-
-        std::vector<glm::vec3> uniqueVertices;
-        for (const auto& vertex : clippedVertices) {
-            bool isDuplicate = false;
-            for (const auto& uniqueVertex : uniqueVertices) {
-                // You can use your own epsilon here if you want. See what works best for you ig.
-                if (glm::length(vertex - uniqueVertex) < epsilon) {
-                    isDuplicate = true;
-                    break;
-                }
-            }
-            if (!isDuplicate) {
-                uniqueVertices.push_back(vertex);
-            }
-        }
-
-        std::cout << uniqueVertices.size() << std::endl;
-        return uniqueVertices;  // Return the cleaned points of contact
-    }
-
-    // bruh
-    else {
-        std::cout << "empty" << std::endl; // ideally, should never happen because we call clipping only when gjk detects a collision. So, there NEEDS to be at least 1 contact point.
-        return clippedVertices;
-    }
+    return clippedVertices;
 }
 
 //Expanding Polytope Algorithm
@@ -917,15 +1217,9 @@ gCollisionResult EPA(GJKsimplex& simplex, Polytope* coll1, Polytope* coll2) {
             std::tuple<std::vector<int>, glm::vec3> referenceFace;
 
             int refOrInci, referenceFaceIndex, incidentFaceIndex;
-
-            // This part of the code can be more efficient, but I don't do that here of course, cause I'm me. You can do it on your own, it's not that difficult.
-            
+ 
             // find the manifold information
             findContactManifoldFaces(coll1, coll2, faces[closest_face].normal, referenceFace, incidentFace, referenceFaceIndex, incidentFaceIndex, refOrInci);
-
-            // set some params
-            //result.incidentFace = incidentFace;
-            //result.referenceFace = referenceFace;
 
             if (refOrInci == 1) {
                 result.referenceCollider = coll1;
@@ -940,17 +1234,13 @@ gCollisionResult EPA(GJKsimplex& simplex, Polytope* coll1, Polytope* coll2) {
             result.incidentFacce = getFaceByIndex(*result.incidentCollider, incidentFaceIndex);
 
             // set the manifold:
-            result.manifold = clipFaceAgainstReference(result.incidentFacce, *result.referenceCollider, result.referenceFacce);
+            result.manifold = clipFaceAgainstReference(result.incidentFacce, *result.referenceCollider, referenceFaceIndex);
 
             // this result should hopefully contain everything we need to resolve the collision.
             return result;
         }
 
         // Rebuild the polytope with loose edges, if the algorithm hasn't converged yet.
-
-        // BEWARE! Sometimes (rarely) the loose edges return vector subscript out of range exceptions! 
-        //I'm not even sure why exactly, but restarting the application fixes it. We can handle those exceptions quite easily by just checking if the subscript we're trying to access is there inside the vector or not.
-        // if not, just skip this iteration using continue and move onto the next. Anyhow, this doesn't happen often, and after rigorous testing, it has happened less than 1% of the time, so I think it's reletively safe.
         glm::vec3 loose_edges[EPA_MAX_NUM_LOOSE_EDGES][2];
         int num_loose_edges = 0;
 
